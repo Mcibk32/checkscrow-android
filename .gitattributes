@@ -1,0 +1,23 @@
+# Force these file types to always be treated as binary.
+# This prevents line-ending conversion (CRLF/LF) and text/encoding
+# normalization tools from corrupting binary content — which is what
+# caused the Android PNG resources (and gradle-wrapper.jar) in this
+# project to be mangled into invalid UTF-8 text.
+
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.gif   binary
+*.ico   binary
+*.bmp   binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+*.jar   binary
+*.zip   binary
+*.keystore binary
+*.jks   binary
+*.aab   binary
+*.apk   binary

@@ -1,0 +1,6 @@
+{
+  "name": "CHECKSCROW",
+  "description": "Nigerian Escrow Marketplace - Safe and secure escrow transactions in Naira (₦).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

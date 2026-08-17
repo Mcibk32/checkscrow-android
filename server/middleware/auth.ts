@@ -54,8 +54,16 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
     }
   }
 
-  // Fallback: If no CLERK_SECRET_KEY configured or in testing environment, inspect token structure
-  if (!clerkUserId) {
+  // Fallback: ONLY when CLERK_SECRET_KEY is not configured at all (local/testing
+  // environments without Clerk backend credentials), inspect the token structure
+  // without verifying its signature.
+  // SECURITY: this must NEVER run merely because verifyToken() failed while a
+  // secret key IS configured - falling back to an unverified decode in that case
+  // would let an attacker submit a forged Clerk-shaped JWT with an arbitrary
+  // `email` claim and get linked to (or auto-provisioned into) another person's
+  // account. A failed verification must stay unauthenticated, not degrade to
+  // trusting an unverified payload.
+  if (!clerkUserId && !CLERK_SECRET_KEY) {
     try {
       const unverified = jwt.decode(token) as any;
       if (unverified && (unverified.sub?.startsWith('user_') || unverified.iss?.includes('clerk') || unverified.sid)) {

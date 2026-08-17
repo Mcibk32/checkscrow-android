@@ -50,9 +50,13 @@ export async function registerUser(req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    const existingUser = await getRow(`SELECT id FROM users WHERE email = $1`, [trimmedEmail]);
+    const existingUser = await getRow(`SELECT id FROM users WHERE LOWER(TRIM(email)) = $1`, [trimmedEmail]);
     if (existingUser) {
-      res.status(400).json({ success: false, error: 'An account with this email address already exists.' });
+      res.status(409).json({
+        success: false,
+        error: 'An account with this email address already exists. Please sign in instead.',
+        code: 'EMAIL_ALREADY_EXISTS',
+      });
       return;
     }
 

@@ -61,16 +61,20 @@ const ClerkNativeRegisterForm: React.FC = () => {
     }
 
     setIsGoogleLoading(true);
+    // DIAGNOSTIC: see matching note in LoginPage.tsx's handleGoogleSignIn.
+    console.log('[Auth] Starting Clerk Google OAuth redirect (sign-up)...');
     try {
       await signUp.authenticateWithRedirect({
         strategy: 'oauth_google',
         redirectUrl: '/dashboard',
         redirectUrlComplete: '/dashboard',
       });
+      console.log('[Auth] signUp.authenticateWithRedirect() call returned (navigation may be in progress).');
     } catch (err: unknown) {
       setIsGoogleLoading(false);
       const clerkErr = err as { errors?: Array<{ message?: string; longMessage?: string }> };
       const msg = clerkErr?.errors?.[0]?.longMessage || clerkErr?.errors?.[0]?.message || 'Google sign-up could not be completed. Please try again.';
+      console.error('[Auth] Google OAuth redirect FAILED before leaving the app:', err);
       setErrorMessage(msg);
     }
   };

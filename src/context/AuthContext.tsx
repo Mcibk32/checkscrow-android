@@ -166,12 +166,17 @@ const ClerkAuthBridge: React.FC<{ children: ReactNode }> = ({ children }) => {
   }, [isLoaded]);
 
   const fetchPostgresUser = useCallback(async () => {
+    // DIAGNOSTIC: confirms whether GET /api/auth/me was actually called and
+    // what it returned, without logging the token itself.
+    console.log('[Auth] Calling GET /api/auth/me to resolve/link the CHECKSCROW profile...');
     try {
       const res = await authService.getCurrentUser();
       if (res.success && res.data) {
+        console.log(`[Auth] /api/auth/me resolved PostgreSQL user id=${res.data.id}`);
         setUser(res.data);
         setIsGuestExplorer(false);
       } else {
+        console.warn(`[Auth] /api/auth/me did not resolve a user: ${res.error || '(no error message)'} code=${res.code || '(none)'}`);
         setUser(null);
       }
     } catch (err) {
@@ -196,6 +201,9 @@ const ClerkAuthBridge: React.FC<{ children: ReactNode }> = ({ children }) => {
     }
 
     if (isSignedIn) {
+      // DIAGNOSTIC: confirms Clerk itself reached a signed-in state (Google
+      // or email/password) before we ever attempt to sync with the backend.
+      console.log('[Auth] Clerk isSignedIn=true - registering token getter and syncing with backend.');
       setIsLoading(true);
       // Register token getter for automatic fresh Clerk session token on every API request
       api.setTokenGetter(async () => {

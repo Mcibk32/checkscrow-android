@@ -32,6 +32,13 @@ function getClerkClient() {
   return clerkClientInstance;
 }
 
+function maskEmail(email: string | null): string {
+  if (!email) return '(none)';
+  const at = email.indexOf('@');
+  if (at <= 1) return '***' + email.slice(at);
+  return email.slice(0, 2) + '***' + email.slice(at);
+}
+
 export async function resolveUserFromToken(token: string): Promise<AuthenticatedUser | null> {
   // 1. Try Clerk Token Verification
   let clerkUserId: string | null = null;
@@ -49,8 +56,13 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
         clerkUserId = verified.sub;
         if ((verified as any).email) clerkEmail = (verified as any).email;
       }
-    } catch {
-      // Token signature failed with CLERK_SECRET_KEY
+      console.log(`[Auth] Clerk token verified. sub=${clerkUserId ? clerkUserId.slice(0, 10) + '...' : '(none)'} tokenEmailClaim=${maskEmail(clerkEmail)}`);
+    } catch (verifyErr: any) {
+      // DIAGNOSTIC: this is the #1 place the "linking" flow silently stops.
+      // A wrong/mismatched CLERK_SECRET_KEY (i.e. not the secret key for the
+      // SAME Clerk instance as the frontend's pk_live_ publishable key), an
+      // expired token, or a clock-skew issue all land here.
+      console.warn('[Auth] Clerk verifyToken FAILED - treating as unverified:', verifyErr?.message || verifyErr);
     }
   }
 
@@ -84,21 +96,42 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
       [clerkUserId]
     );
 
-    // If not found by uid, attempt to fetch user profile details from Clerk API if configured
+    // If not found by uid, attempt to fetch user profile details from Clerk API if configured.
+    // This is the ONLY reliable source of the verified email for a fresh device
+    // session (Clerk session tokens do not carry an `email` claim by default).
+    let clerkProfileFetchFailed = false;
     if (!userRow && CLERK_SECRET_KEY) {
       try {
         const client = getClerkClient();
         if (client) {
           const clerkUser = await client.users.getUser(clerkUserId);
           if (clerkUser) {
-            clerkEmail = clerkUser.emailAddresses?.[0]?.emailAddress || clerkEmail;
+            // Prefer the account's actual PRIMARY email address (not just index 0,
+            // which could be a secondary/unverified address on multi-email accounts).
+            const primaryEmail =
+              clerkUser.emailAddresses?.find((e: any) => e.id === clerkUser.primaryEmailAddressId)?.emailAddress ||
+              clerkUser.emailAddresses?.[0]?.emailAddress ||
+              null;
+            if (primaryEmail) clerkEmail = primaryEmail;
             const name = `${clerkUser.firstName || ''} ${clerkUser.lastName || ''}`.trim();
             if (name) clerkFullName = name;
             clerkPhone = clerkUser.phoneNumbers?.[0]?.phoneNumber || clerkPhone;
+            console.log(`[Auth] Clerk profile fetched for uid=${clerkUserId.slice(0, 10)}... resolvedEmail=${maskEmail(clerkEmail)}`);
+          } else {
+            console.warn(`[Auth] Clerk users.getUser(${clerkUserId.slice(0, 10)}...) returned no user.`);
           }
+        } else {
+          console.warn('[Auth] Clerk client unavailable (CLERK_SECRET_KEY missing at getClerkClient()).');
         }
-      } catch (clerkErr) {
-        console.warn('Clerk API user fetch error (non-fatal):', clerkErr);
+      } catch (clerkErr: any) {
+        clerkProfileFetchFailed = true;
+        // DIAGNOSTIC: this is the #2 place the flow silently stops. If this
+        // throws (wrong secret key for this Clerk instance, network egress
+        // blocked from this server to api.clerk.com, revoked key, etc.), we
+        // MUST NOT silently fall through to creating a placeholder-email
+        // account below - that is exactly how duplicate/garbage accounts get
+        // created instead of linking to the real one.
+        console.error(`[Auth] Clerk API user fetch FAILED for uid=${clerkUserId.slice(0, 10)}... :`, clerkErr?.message || clerkErr);
       }
     }
 
@@ -106,7 +139,7 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
     if (!userRow && clerkEmail) {
       userRow = await getRow<any>(
         `SELECT id, uid, email, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at 
-         FROM users WHERE email = $1`,
+         FROM users WHERE LOWER(TRIM(email)) = $1`,
         [clerkEmail.toLowerCase().trim()]
       );
 
@@ -114,11 +147,22 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
         // Link Clerk UID to existing user
         await runQuery(`UPDATE users SET uid = $1, updated_at = NOW() WHERE id = $2`, [clerkUserId, userRow.id]);
         userRow.uid = clerkUserId;
+        console.log(`[Auth] Linked existing PostgreSQL user id=${userRow.id} to Clerk uid=${clerkUserId.slice(0, 10)}... (matched by email)`);
       }
+    }
+
+    // If we still don't have a verified email AND the Clerk profile fetch
+    // itself failed (as opposed to genuinely having no email on file), refuse
+    // to auto-provision. Creating a user here would use a fake placeholder
+    // email and can never be matched to the person's real website account.
+    if (!userRow && !clerkEmail && clerkProfileFetchFailed) {
+      console.error(`[Auth] Refusing to auto-provision a new user for uid=${clerkUserId.slice(0, 10)}... - could not obtain a verified email from Clerk. Treating session as unauthenticated.`);
+      return null;
     }
 
     // If still not found, auto-provision the new customer in PostgreSQL with a zero-balance wallet
     if (!userRow) {
+      console.log(`[Auth] No existing PostgreSQL user for uid=${clerkUserId.slice(0, 10)}... email=${maskEmail(clerkEmail)} - provisioning new account.`);
       const newUserId = 'usr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
       const newWalletId = 'wal_' + Date.now();
       const safeEmail = (clerkEmail || `${clerkUserId}@user.checkscrow.ng`).toLowerCase().trim();
@@ -216,6 +260,10 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
 export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    // DIAGNOSTIC: if the APK is hitting this branch for /api/auth/me, the
+    // problem is upstream in the frontend (no token was ever attached) - see
+    // ClerkAuthBridge / api.ts, not this file.
+    console.warn(`[Auth] requireAuth: no Bearer token on ${req.method} ${req.originalUrl}`);
     res.status(401).json({
       success: false,
       error: 'Authentication required. Please log in.',
@@ -229,6 +277,7 @@ export async function requireAuth(req: AuthenticatedRequest, res: Response, next
     const authUser = await resolveUserFromToken(token);
 
     if (!authUser) {
+      console.warn(`[Auth] requireAuth: resolveUserFromToken returned null for ${req.method} ${req.originalUrl} - see [Auth] logs above for the exact reason.`);
       res.status(401).json({
         success: false,
         error: 'Invalid or expired authentication token.',
@@ -236,6 +285,7 @@ export async function requireAuth(req: AuthenticatedRequest, res: Response, next
       });
       return;
     }
+    console.log(`[Auth] requireAuth: resolved user id=${authUser.id} for ${req.method} ${req.originalUrl}`);
 
     if (authUser.accountStatus === 'suspended') {
       res.status(403).json({

@@ -6,18 +6,15 @@ const getBaseUrl = (): string => {
   const customApiBase = (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE_URL ||
                         (import.meta as unknown as { env?: Record<string, string> }).env?.PRODUCTION_API_BASE_URL;
   if (customApiBase && typeof customApiBase === 'string' && customApiBase.trim() !== '') {
-    return customApiBase.trim().replace(/\/+$/, '');
+    const trimmed = customApiBase.trim().replace(/\/+$/, '');
+    console.log(`[API] custom base provided: ${trimmed}`);
+    return trimmed;
   }
 
-  // When running inside the native Android/iOS Capacitor shell, relative
-  // paths resolve against Capacitor's local WebView asset server (not the
-  // real internet), so we must always use an absolute production API URL.
-  // `Capacitor.isNativePlatform()` is reliable regardless of `androidScheme`/
-  // `hostname` config - unlike sniffing `window.location`, which reports
-  // `https://localhost` (not `capacitor:`/`file:`) under the default
-  // `androidScheme: 'https'` setup and was silently falling through to `/api`.
+  // When running inside the native Android/iOS Capacitor shell, always use an absolute production API URL.
   try {
     if (Capacitor.isNativePlatform()) {
+      console.log('[API] running on native platform, using production API base');
       return 'https://www.checkscrow.com.ng/api';
     }
   } catch {
@@ -29,6 +26,7 @@ const getBaseUrl = (): string => {
     const protocol = window.location.protocol.toLowerCase();
     const hostname = window.location.hostname.toLowerCase();
     if (protocol === 'capacitor:' || protocol === 'ionic:' || protocol === 'file:' || hostname === '') {
+      console.log('[API] running in special webview protocol, using production API base');
       return 'https://www.checkscrow.com.ng/api';
     }
   }
@@ -45,6 +43,12 @@ class ApiClient {
 
   constructor() {
     this.token = typeof window !== 'undefined' ? localStorage.getItem('checkscrow_auth_token') : null;
+    try {
+      const isNative = (Capacitor as any)?.isNativePlatform ? Capacitor.isNativePlatform() : false;
+      console.log(`[API] native=${isNative} base=${API_BASE_URL}`);
+    } catch (e) {
+      console.log('[API] initialization - unable to determine native/platform');
+    }
   }
 
   public setTokenGetter(getter: (() => Promise<string | null>) | null) {
@@ -68,7 +72,7 @@ class ApiClient {
         const freshToken = await this.tokenGetter();
         if (freshToken) return freshToken;
       } catch (err) {
-        console.warn('Could not retrieve Clerk token from getter:', err);
+        console.warn('[API] tokenGetter threw an error while retrieving token:', err?.message || err);
       }
     }
     if (!this.token && typeof window !== 'undefined') {
@@ -87,7 +91,7 @@ class ApiClient {
   public async request<T>(endpoint: string, options: RequestInit = {}): Promise<ApiResponse<T>> {
     const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
     const url = `${API_BASE_URL}${cleanEndpoint}`;
-    
+
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'application/json',
@@ -95,11 +99,14 @@ class ApiClient {
     };
 
     const currentToken = await this.getEffectiveToken();
+    const tokenPresent = !!currentToken;
     if (currentToken) {
       headers['Authorization'] = `Bearer ${currentToken}`;
     }
 
     try {
+      console.log(`[API] ${options.method || 'GET'} ${url} tokenPresent=${tokenPresent}`);
+
       const response = await fetch(url, {
         ...options,
         headers,
@@ -107,20 +114,30 @@ class ApiClient {
 
       const data = await response.json().catch(() => null);
 
+      console.log(`[API] ${options.method || 'GET'} ${url} status=${response.status}`);
+
       if (!response.ok) {
         if (response.status === 401) {
           // Token expired or invalid
           return {
             success: false,
-            error: data?.error || data?.message || 'Authentication required. Please log in.',
+            error: data?.error || data?.message || 'Authentication session expired. Please sign in again.',
             code: 'UNAUTHORIZED',
+          };
+        }
+
+        if (response.status === 403) {
+          return {
+            success: false,
+            error: data?.error || data?.message || 'Access denied. You do not have permission to access this resource.',
+            code: 'FORBIDDEN',
           };
         }
 
         if (response.status === 404) {
           return {
             success: false,
-            error: data?.error || data?.message || 'The requested resource was not found. Please try again.',
+            error: data?.error || data?.message || 'The requested CHECKSCROW API resource was not found. Please try again.',
             code: 'NOT_FOUND',
           };
         }
@@ -140,8 +157,6 @@ class ApiClient {
       };
     } catch (err: any) {
       // Surface the real transport-level failure (CORS, TLS, DNS, refused, etc.)
-      // to the WebView console so it's visible via `chrome://inspect` on
-      // Android, instead of only ever showing the generic user-facing string.
       console.error(`[API] Request to ${url} failed:`, err?.name, err?.message, err);
       return {
         success: false,

@@ -24,6 +24,11 @@ function initPgliteFallback() {
   usingPostgresPool = false;
 }
 
+// Enforce production DATABASE_URL presence and forbid PGlite fallback in production
+if (process.env.NODE_ENV === 'production' && !dbUrl) {
+  throw new Error('Missing DATABASE_URL in production; refusing to start with embedded fallback.');
+}
+
 if (dbUrl.startsWith('postgres://') || dbUrl.startsWith('postgresql://')) {
   console.log('Configuring PostgreSQL connection pool via pg.Pool...');
   poolInstance = new Pool({
@@ -39,6 +44,12 @@ if (dbUrl.startsWith('postgres://') || dbUrl.startsWith('postgresql://')) {
         const res = await poolInstance.query(sql, params);
         return { rows: res.rows, rowCount: res.rowCount || 0 };
       } catch (err: any) {
+        // In production we should NOT silently fallback to PGlite; surface error
+        if (process.env.NODE_ENV === 'production') {
+          console.error('[Database] PostgreSQL query error in production; refusing to fallback to PGlite:', err);
+          throw err;
+        }
+        // In non-production: allow dynamic fallback if host unreachable
         if (err.code === 'EAI_AGAIN' || err.code === 'ENOTFOUND' || err.message?.includes('getaddrinfo')) {
           console.warn('[Database] External PostgreSQL host unreachable from this network context. Falling back to local PostgreSQL engine (PGlite)...');
           initPgliteFallback();
@@ -53,6 +64,10 @@ if (dbUrl.startsWith('postgres://') || dbUrl.startsWith('postgresql://')) {
     }
   };
 } else {
+  // Non-postgres URL: allow pglite fallback only for non-production
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('DATABASE_URL is not a valid Postgres URL in production; refusing to start.');
+  }
   initPgliteFallback();
 }
 
@@ -78,8 +93,13 @@ export async function withTransaction<T>(
         client.release();
       }
     } catch (connErr: any) {
+      // In production, fail startup / bubble error rather than local fallback.
+      if (process.env.NODE_ENV === 'production') {
+        console.error('[Database Transaction] Unable to obtain Postgres client in production:', connErr);
+        throw connErr;
+      }
       if (connErr.code === 'EAI_AGAIN' || connErr.code === 'ENOTFOUND' || connErr.message?.includes('getaddrinfo')) {
-        console.warn('[Database Transaction] External PostgreSQL host unreachable. Using local PGlite transaction...');
+        console.warn('[Database Transaction] External PostgreSQL host unreachable. Using local PGlite transaction (non-production)...');
         initPgliteFallback();
       } else {
         throw connErr;

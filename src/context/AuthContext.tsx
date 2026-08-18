@@ -79,6 +79,7 @@ interface AuthContextType {
   clearError: () => void;
   setGuestExplorer: (val: boolean) => void;
   refetchUser: () => Promise<void>;
+  refetchUserWithTimeout?: (timeoutMs?: number) => Promise<boolean>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -165,25 +166,53 @@ const ClerkAuthBridge: React.FC<{ children: ReactNode }> = ({ children }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoaded]);
 
-  const fetchPostgresUser = useCallback(async () => {
+  const getTokenWithRetries = async (
+    getTokenFn: () => Promise<string | null>,
+    delays = [0, 250, 500, 1000]
+  ): Promise<string | null> => {
+    for (const delay of delays) {
+      if (delay > 0) {
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+
+      try {
+        const token = await getTokenFn();
+
+        if (token) {
+          return token;
+        }
+      } catch {
+        // Retry
+      }
+    }
+
+    return null;
+  };
+
+  const fetchPostgresUser = useCallback(async (): Promise<boolean> => {
     // DIAGNOSTIC: confirms whether GET /api/auth/me was actually called and
     // what it returned, without logging the token itself.
     console.log('[Auth] Calling GET /api/auth/me to resolve/link the CHECKSCROW profile...');
     try {
       const res = await authService.getCurrentUser();
+      console.log(`[Auth] /api/auth/me status=${res.success ? '200' : 'non-200'} code=${res.code || '(none)'} msg=${res.error || '(none)'}'`);
       if (res.success && res.data) {
         console.log(`[Auth] /api/auth/me resolved PostgreSQL user id=${res.data.id}`);
         setUser(res.data);
         setIsGuestExplorer(false);
+        setIsLoading(false);
+        return true;
       } else {
-        console.warn(`[Auth] /api/auth/me did not resolve a user: ${res.error || '(no error message)'} code=${res.code || '(none)'}`);
+        console.warn(`[Auth] /api/auth/me did not resolve a user: ${res.error || '(no error message)'} code=${res.code || '(none)'}'`);
         setUser(null);
+        setIsLoading(false);
+        return false;
       }
     } catch (err) {
       console.warn('Failed to sync PostgreSQL profile for Clerk user:', err);
       setUser(null);
-    } finally {
       setIsLoading(false);
+      return false;
     }
   }, []);
 
@@ -205,16 +234,29 @@ const ClerkAuthBridge: React.FC<{ children: ReactNode }> = ({ children }) => {
       // or email/password) before we ever attempt to sync with the backend.
       console.log('[Auth] Clerk isSignedIn=true - registering token getter and syncing with backend.');
       setIsLoading(true);
-      // Register token getter for automatic fresh Clerk session token on every API request
-      api.setTokenGetter(async () => {
-        try {
-          return await getToken();
-        } catch {
-          return null;
-        }
-      });
 
-      fetchPostgresUser();
+      (async () => {
+        const token = await getTokenWithRetries(getToken);
+        console.log('[Auth] token available=' + (!!token));
+
+        if (!token) {
+          console.warn('[Auth] Clerk session exists but no session token could be obtained');
+          api.setTokenGetter(null);
+          api.setToken(null);
+          setUser(null);
+          setIsLoading(false);
+          return;
+        }
+
+        // register tokenGetter that itself retries on demand
+        api.setTokenGetter(async () => await getTokenWithRetries(getToken));
+
+        // set API client cache token for fallback storage
+        api.setToken(token);
+
+        const success = await fetchPostgresUser();
+        console.log(`[Auth] Authentication bootstrap complete success=${success}`);
+      })();
     } else {
       api.setTokenGetter(null);
       api.setToken(null);
@@ -289,6 +331,34 @@ const ClerkAuthBridge: React.FC<{ children: ReactNode }> = ({ children }) => {
   const kycBadge = getKycBadgeInfo(user, !isRealUser);
   const displayName = isRealUser ? (user.fullName || clerkUser?.fullName || 'CHECKSCROW User') : 'Guest Explorer';
 
+  const refetchUserWithTimeout = async (timeoutMs = 8000): Promise<boolean> => {
+    try {
+      // attempt to obtain token and ensure token getter is installed
+      const token = await getTokenWithRetries(getToken);
+      if (!token) {
+        console.warn('[Auth] refetchUserWithTimeout: no token obtained');
+        return false;
+      }
+      api.setTokenGetter(async () => await getTokenWithRetries(getToken));
+      api.setToken(token);
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const ok = await fetchPostgresUser();
+        clearTimeout(timer);
+        return ok;
+      } catch (err) {
+        clearTimeout(timer);
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  };
+
+  const clearErr = () => setError(null);
+
   return (
     <AuthContext.Provider
       value={{
@@ -308,9 +378,10 @@ const ClerkAuthBridge: React.FC<{ children: ReactNode }> = ({ children }) => {
         login,
         register,
         logout,
-        clearError,
+        clearError: clearErr,
         setGuestExplorer: setIsGuestExplorer,
         refetchUser: fetchPostgresUser,
+        refetchUserWithTimeout,
       }}
     >
       {children}
@@ -457,4 +528,3 @@ export const useAuthContext = () => {
   }
   return context;
 };
-

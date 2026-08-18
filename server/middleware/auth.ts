@@ -1,11 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { createClerkClient, verifyToken } from '@clerk/backend';
-import { getRow, runQuery } from '../db/database';
+import { getRow, runQuery, withTransaction } from '../db/database';
 import { createNotification } from '../services/notificationService';
 
-export const JWT_SECRET = process.env.JWT_SECRET || 'checkscrow_dev_secret_key_2026_super_secure';
+export const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'checkscrow_dev_secret_key_2026_super_secure');
 export const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
+
+if (process.env.NODE_ENV === 'production') {
+  if (!CLERK_SECRET_KEY) {
+    throw new Error('Missing CLERK_SECRET_KEY in production');
+  }
+  if (!process.env.JWT_SECRET) {
+    throw new Error('Missing JWT_SECRET in production');
+  }
+}
 
 export interface AuthenticatedUser {
   id: string;
@@ -58,56 +67,25 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
       }
       console.log(`[Auth] Clerk token verified. sub=${clerkUserId ? clerkUserId.slice(0, 10) + '...' : '(none)'} tokenEmailClaim=${maskEmail(clerkEmail)}`);
     } catch (verifyErr: any) {
-      // DIAGNOSTIC: this is the #1 place the "linking" flow silently stops.
-      // A wrong/mismatched CLERK_SECRET_KEY (i.e. not the secret key for the
-      // SAME Clerk instance as the frontend's pk_live_ publishable key), an
-      // expired token, or a clock-skew issue all land here.
-      console.warn('[Auth] Clerk verifyToken FAILED - treating as unverified:', verifyErr?.message || verifyErr);
+      console.warn('[Auth] Clerk verifyToken FAILED - treating as unauthenticated:', verifyErr?.message || verifyErr);
+      // Do NOT fall back to unverified decoding. Treat as unauthenticated.
+      clerkUserId = null;
     }
+  } else {
+    // No CLERK_SECRET_KEY configured; do not accept Clerk tokens (especially in production we threw earlier).
+    console.warn('[Auth] CLERK_SECRET_KEY not configured. Clerk-based authentication disabled.');
   }
 
-  // Fallback: ONLY when CLERK_SECRET_KEY is not configured at all (local/testing
-  // environments without Clerk backend credentials), inspect the token structure
-  // without verifying its signature.
-  // SECURITY: this must NEVER run merely because verifyToken() failed while a
-  // secret key IS configured - falling back to an unverified decode in that case
-  // would let an attacker submit a forged Clerk-shaped JWT with an arbitrary
-  // `email` claim and get linked to (or auto-provisioned into) another person's
-  // account. A failed verification must stay unauthenticated, not degrade to
-  // trusting an unverified payload.
-  if (!clerkUserId && !CLERK_SECRET_KEY) {
-    try {
-      const unverified = jwt.decode(token) as any;
-      if (unverified && (unverified.sub?.startsWith('user_') || unverified.iss?.includes('clerk') || unverified.sid)) {
-        clerkUserId = unverified.sub;
-        if (unverified.email) clerkEmail = unverified.email;
-        if (unverified.name) clerkFullName = unverified.name;
-        if (unverified.phone_number) clerkPhone = unverified.phone_number;
-      }
-    } catch {}
-  }
-
-  // If identified as a Clerk user
+  // If identified as a Clerk user (verified only) proceed
   if (clerkUserId) {
-    // Check if user exists in PostgreSQL by uid
-    let userRow = await getRow<any>(
-      `SELECT id, uid, email, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at 
-       FROM users WHERE uid = $1`,
-      [clerkUserId]
-    );
-
-    // If not found by uid, attempt to fetch user profile details from Clerk API if configured.
-    // This is the ONLY reliable source of the verified email for a fresh device
-    // session (Clerk session tokens do not carry an `email` claim by default).
+    // Attempt to fetch Clerk profile details from Clerk API if configured.
     let clerkProfileFetchFailed = false;
-    if (!userRow && CLERK_SECRET_KEY) {
+    if (CLERK_SECRET_KEY) {
       try {
         const client = getClerkClient();
         if (client) {
           const clerkUser = await client.users.getUser(clerkUserId);
           if (clerkUser) {
-            // Prefer the account's actual PRIMARY email address (not just index 0,
-            // which could be a secondary/unverified address on multi-email accounts).
             const primaryEmail =
               clerkUser.emailAddresses?.find((e: any) => e.id === clerkUser.primaryEmailAddressId)?.emailAddress ||
               clerkUser.emailAddresses?.[0]?.emailAddress ||
@@ -125,105 +103,149 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
         }
       } catch (clerkErr: any) {
         clerkProfileFetchFailed = true;
-        // DIAGNOSTIC: this is the #2 place the flow silently stops. If this
-        // throws (wrong secret key for this Clerk instance, network egress
-        // blocked from this server to api.clerk.com, revoked key, etc.), we
-        // MUST NOT silently fall through to creating a placeholder-email
-        // account below - that is exactly how duplicate/garbage accounts get
-        // created instead of linking to the real one.
         console.error(`[Auth] Clerk API user fetch FAILED for uid=${clerkUserId.slice(0, 10)}... :`, clerkErr?.message || clerkErr);
       }
     }
 
-    // If still not found by uid, check by email to link existing PostgreSQL account
-    if (!userRow && clerkEmail) {
-      userRow = await getRow<any>(
-        `SELECT id, uid, email, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at 
-         FROM users WHERE LOWER(TRIM(email)) = $1`,
-        [clerkEmail.toLowerCase().trim()]
-      );
+    try {
+      // Use a transaction to perform safe linking/provisioning and wallet creation
+      const userRow = await withTransaction<any>(async (txQuery) => {
+        // 1) Re-check by UID inside the transaction
+        let res = await txQuery(
+          `SELECT id, uid, email, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at 
+           FROM users WHERE uid = $1`,
+          [clerkUserId]
+        );
+        if (res.rowCount > 0) {
+          return res.rows[0];
+        }
 
-      if (userRow) {
-        // Link Clerk UID to existing user
-        await runQuery(`UPDATE users SET uid = $1, updated_at = NOW() WHERE id = $2`, [clerkUserId, userRow.id]);
-        userRow.uid = clerkUserId;
-        console.log(`[Auth] Linked existing PostgreSQL user id=${userRow.id} to Clerk uid=${clerkUserId.slice(0, 10)}... (matched by email)`);
-      }
-    }
+        // 2) If not found by uid, and we have an email, check by email
+        if (clerkEmail) {
+          res = await txQuery(
+            `SELECT id, uid, email, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at 
+             FROM users WHERE LOWER(TRIM(email)) = $1`,
+            [clerkEmail.toLowerCase().trim()]
+          );
 
-    // If we still don't have a verified email AND the Clerk profile fetch
-    // itself failed (as opposed to genuinely having no email on file), refuse
-    // to auto-provision. Creating a user here would use a fake placeholder
-    // email and can never be matched to the person's real website account.
-    if (!userRow && !clerkEmail && clerkProfileFetchFailed) {
-      console.error(`[Auth] Refusing to auto-provision a new user for uid=${clerkUserId.slice(0, 10)}... - could not obtain a verified email from Clerk. Treating session as unauthenticated.`);
-      return null;
-    }
+          if (res.rowCount > 0) {
+            const existing = res.rows[0];
+            const existingUid = existing.uid || null;
+            if (!existingUid) {
+              // Safe to link: set uid
+              await txQuery(`UPDATE users SET uid = $1, updated_at = NOW() WHERE id = $2`, [clerkUserId, existing.id]);
+              existing.uid = clerkUserId;
+              return existing;
+            }
+            if (existingUid === clerkUserId) {
+              return existing;
+            }
 
-    // If still not found, auto-provision the new customer in PostgreSQL with a zero-balance wallet
-    if (!userRow) {
-      console.log(`[Auth] No existing PostgreSQL user for uid=${clerkUserId.slice(0, 10)}... email=${maskEmail(clerkEmail)} - provisioning new account.`);
-      const newUserId = 'usr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
-      const newWalletId = 'wal_' + Date.now();
-      const safeEmail = (clerkEmail || `${clerkUserId}@user.checkscrow.ng`).toLowerCase().trim();
-      const safeName = clerkFullName || 'CHECKSCROW User';
-      const safePhone = clerkPhone || '';
-      const now = new Date().toISOString();
+            // Conflict: existing user already linked to another Clerk UID => fail safely
+            throw new Error('CLERK_UID_CONFLICT');
+          }
+        }
 
-      await runQuery(
-        `INSERT INTO users (id, uid, email, password_hash, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at, updated_at)
-         VALUES ($1, $2, $3, '', $4, $5, 'both', 'active', 'unverified', 1, $6, $7)`,
-        [newUserId, clerkUserId, safeEmail, safeName, safePhone, now, now]
-      );
+        // 3) Not found: auto-provision a new user and wallet atomically
+        // Prepare safe values
+        const newUserId = 'usr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+        const newWalletId = 'wal_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+        const safeEmail = (clerkEmail || `${clerkUserId}@user.checkscrow.ng`).toLowerCase().trim();
+        const safeName = clerkFullName || 'CHECKSCROW User';
+        const safePhone = clerkPhone || '';
+        const now = new Date().toISOString();
 
-      await runQuery(
-        `INSERT INTO wallets (id, user_id, available_balance, escrow_balance, pending_withdrawal_balance, currency, updated_at)
-         VALUES ($1, $2, 0.00, 0.00, 0.00, 'NGN', $3)`,
-        [newWalletId, newUserId, now]
-      );
+        try {
+          await txQuery(
+            `INSERT INTO users (id, uid, email, password_hash, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at, updated_at)
+             VALUES ($1, $2, $3, '', $4, $5, 'both', 'active', 'unverified', 1, $6, $7)`,
+            [newUserId, clerkUserId, safeEmail, safeName, safePhone, now, now]
+          );
+        } catch (insertErr: any) {
+          // If insert failed due to concurrent insert (unique constraint on email or uid), try to find the existing row and proceed
+          if ((insertErr as any).code === '23505' || /duplicate key value/.test(insertErr?.message || '')) {
+            // Re-fetch by uid then email
+            let r = await txQuery(`SELECT id, uid, email, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at FROM users WHERE uid = $1`, [clerkUserId]);
+            if (r.rowCount > 0) return r.rows[0];
+            r = await txQuery(`SELECT id, uid, email, full_name, phone_number, role, account_status, kyc_status, kyc_tier, created_at FROM users WHERE LOWER(TRIM(email)) = $1`, [safeEmail]);
+            if (r.rowCount > 0) {
+              const existing = r.rows[0];
+              if (!existing.uid) {
+                await txQuery(`UPDATE users SET uid = $1, updated_at = NOW() WHERE id = $2`, [clerkUserId, existing.id]);
+                existing.uid = clerkUserId;
+                return existing;
+              }
+              if (existing.uid === clerkUserId) return existing;
+              throw new Error('CLERK_UID_CONFLICT');
+            }
+            throw insertErr; // rethrow if we cannot resolve
+          }
+          throw insertErr;
+        }
 
-      await runQuery(
-        `INSERT INTO activity_logs (id, user_id, title, description, category, timestamp)
-         VALUES ($1, $2, 'Account Registered', 'Successfully created CHECKSCROW account with Clerk.', 'security', $3)`,
-        ['act_' + Date.now(), newUserId, now]
-      );
+        // Create wallet
+        await txQuery(
+          `INSERT INTO wallets (id, user_id, available_balance, escrow_balance, pending_withdrawal_balance, currency, updated_at)
+           VALUES ($1, $2, 0.00, 0.00, 0.00, 'NGN', $3)`,
+          [newWalletId, newUserId, now]
+        );
 
-      await createNotification({
-        userId: newUserId,
-        type: 'account',
-        title: 'Welcome to CHECKSCROW',
-        message: 'Your account has been successfully created. Welcome aboard!',
-        referenceId: newUserId,
-        referenceType: 'account',
+        // Activity log
+        await txQuery(
+          `INSERT INTO activity_logs (id, user_id, title, description, category, timestamp)
+           VALUES ($1, $2, 'Account Registered', 'Successfully created CHECKSCROW account with Clerk.', 'security', $3)`,
+          ['act_' + Date.now(), newUserId, now]
+        );
+
+        return {
+          id: newUserId,
+          uid: clerkUserId,
+          email: safeEmail,
+          full_name: safeName,
+          phone_number: safePhone,
+          role: 'both',
+          account_status: 'active',
+          kyc_status: 'unverified',
+          kyc_tier: 1,
+          created_at: now,
+        };
       });
 
-      userRow = {
-        id: newUserId,
-        uid: clerkUserId,
-        email: safeEmail,
-        full_name: safeName,
-        phone_number: safePhone,
-        role: 'both',
-        account_status: 'active',
-        kyc_status: 'unverified',
-        kyc_tier: 1,
-        created_at: now,
-      };
-    }
+      // If transaction succeeded, optionally notify outside transaction (notification may use non-transactional paths)
+      if (userRow) {
+        try {
+          await createNotification({
+            userId: userRow.id,
+            type: 'account',
+            title: 'Welcome to CHECKSCROW',
+            message: 'Your account has been successfully created. Welcome aboard!',
+            referenceId: userRow.id,
+            referenceType: 'account',
+          });
+        } catch (notifyErr) {
+          console.warn('[Auth] createNotification failed (non-fatal):', notifyErr?.message || notifyErr);
+        }
 
-    if (userRow) {
-      return {
-        id: userRow.id,
-        uid: userRow.uid || clerkUserId,
-        email: userRow.email,
-        fullName: userRow.full_name,
-        phoneNumber: userRow.phone_number || '',
-        role: userRow.role || 'both',
-        accountStatus: userRow.account_status || 'active',
-        kycStatus: userRow.kyc_status || 'unverified',
-        kycTier: userRow.kyc_tier || 1,
-        createdAt: userRow.created_at,
-      };
+        return {
+          id: userRow.id,
+          uid: userRow.uid || clerkUserId,
+          email: userRow.email,
+          fullName: userRow.full_name,
+          phoneNumber: userRow.phone_number || '',
+          role: userRow.role || 'both',
+          accountStatus: userRow.account_status || 'active',
+          kycStatus: userRow.kyc_status || 'unverified',
+          kycTier: userRow.kyc_tier || 1,
+          createdAt: userRow.created_at,
+        };
+      }
+    } catch (err: any) {
+      if (err?.message === 'CLERK_UID_CONFLICT') {
+        console.error(`[Auth] Clerk UID conflict for uid=${clerkUserId.slice(0, 10)}... - existing account already linked to a different Clerk ID. Refusing to authenticate.`);
+        return null;
+      }
+      console.error('[Auth] Unexpected error during Clerk user resolution:', err?.message || err);
+      return null;
     }
   }
 
@@ -260,9 +282,6 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
 export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    // DIAGNOSTIC: if the APK is hitting this branch for /api/auth/me, the
-    // problem is upstream in the frontend (no token was ever attached) - see
-    // ClerkAuthBridge / api.ts, not this file.
     console.warn(`[Auth] requireAuth: no Bearer token on ${req.method} ${req.originalUrl}`);
     res.status(401).json({
       success: false,

@@ -11,6 +11,8 @@ async function startServer() {
     await initDb();
   } catch (err) {
     console.error('Failed to initialize database:', err);
+    // Fail startup if DB initialization fails in production
+    if (process.env.NODE_ENV === 'production') process.exit(1);
   }
 
   const app = express();
@@ -21,14 +23,34 @@ async function startServer() {
 
   // 0. Explicit CORS middleware for cross-origin / mobile browser requests
   app.use((req: Request, res: Response, next: NextFunction) => {
-    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(200);
+    const originHeader = (req.headers.origin as string) || '';
+    const allowed = (process.env.ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0);
+
+    // If no Origin header (native clients, server-to-server), allow the request
+    if (!originHeader) {
+      res.header('Access-Control-Allow-Credentials', 'true');
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+      if (req.method === 'OPTIONS') return res.sendStatus(200);
+      return next();
     }
-    next();
+
+    // If origin is in the explicit whitelist, echo that exact origin. Do not use '*'.
+    const matched = allowed.find((o) => o === originHeader);
+    if (matched) {
+      res.header('Access-Control-Allow-Origin', matched);
+      res.header('Access-Control-Allow-Credentials', 'true');
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+      if (req.method === 'OPTIONS') return res.sendStatus(200);
+      return next();
+    }
+
+    // Disallowed browser origin — reject preflight or actual requests
+    res.status(403).json({ success: false, error: 'Origin not allowed' });
   });
 
   // 1. Security Headers (Helmet)

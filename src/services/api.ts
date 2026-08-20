@@ -37,12 +37,18 @@ const getBaseUrl = (): string => {
 
 const API_BASE_URL = getBaseUrl();
 
+const SESSION_TOKEN_KEY = 'checkscrow_auth_token';
+
+export type TokenSource = 'session' | 'clerk' | 'none';
+
 class ApiClient {
-  private token: string | null = null;
+  /** CHECKSCROW session JWT issued by POST /auth/login or /auth/register. Persisted. */
+  private sessionToken: string | null = null;
+  /** Returns a freshly minted Clerk session token. Never persisted (Clerk tokens are short lived). */
   private tokenGetter: (() => Promise<string | null>) | null = null;
 
   constructor() {
-    this.token = typeof window !== 'undefined' ? localStorage.getItem('checkscrow_auth_token') : null;
+    this.sessionToken = typeof window !== 'undefined' ? localStorage.getItem(SESSION_TOKEN_KEY) : null;
     try {
       const isNative = (Capacitor as any)?.isNativePlatform ? Capacitor.isNativePlatform() : false;
       console.log(`[API] native=${isNative} base=${API_BASE_URL}`);
@@ -56,36 +62,51 @@ class ApiClient {
   }
 
   public setToken(token: string | null) {
-    this.token = token;
+    this.sessionToken = token;
     if (typeof window !== 'undefined') {
       if (token) {
-        localStorage.setItem('checkscrow_auth_token', token);
+        localStorage.setItem(SESSION_TOKEN_KEY, token);
       } else {
-        localStorage.removeItem('checkscrow_auth_token');
+        localStorage.removeItem(SESSION_TOKEN_KEY);
       }
     }
+    console.log(`[SESSION] CHECKSCROW session token ${token ? `stored (length=${token.length})` : 'cleared'}`);
   }
 
-  public async getEffectiveToken(): Promise<string | null> {
+  /**
+   * A CHECKSCROW session token always wins over a Clerk token: it is the
+   * credential the user explicitly signed in with, and it is long lived.
+   * The Clerk getter is only consulted when there is no manual session, and
+   * it is always asked for a fresh token rather than reusing a cached one.
+   */
+  public async getEffectiveToken(): Promise<{ token: string | null; source: TokenSource }> {
+    const stored = this.getToken();
+    if (stored) {
+      return { token: stored, source: 'session' };
+    }
+
     if (this.tokenGetter) {
       try {
         const freshToken = await this.tokenGetter();
-        if (freshToken) return freshToken;
-      } catch (err) {
-        console.warn('[API] tokenGetter threw an error while retrieving token:', err?.message || err);
+        if (freshToken) return { token: freshToken, source: 'clerk' };
+        console.warn('[CLERK] tokenGetter returned no token');
+      } catch (err: any) {
+        console.warn('[CLERK] tokenGetter threw an error while retrieving token:', err?.message || err);
       }
     }
-    if (!this.token && typeof window !== 'undefined') {
-      this.token = localStorage.getItem('checkscrow_auth_token');
-    }
-    return this.token;
+
+    return { token: null, source: 'none' };
   }
 
   public getToken(): string | null {
-    if (!this.token && typeof window !== 'undefined') {
-      this.token = localStorage.getItem('checkscrow_auth_token');
+    if (!this.sessionToken && typeof window !== 'undefined') {
+      this.sessionToken = localStorage.getItem(SESSION_TOKEN_KEY);
     }
-    return this.token;
+    return this.sessionToken;
+  }
+
+  public hasSessionToken(): boolean {
+    return !!this.getToken();
   }
 
   public async request<T>(endpoint: string, options: RequestInit = {}): Promise<ApiResponse<T>> {
@@ -98,14 +119,15 @@ class ApiClient {
       ...(options.headers as Record<string, string> || {}),
     };
 
-    const currentToken = await this.getEffectiveToken();
-    const tokenPresent = !!currentToken;
+    const { token: currentToken, source } = await this.getEffectiveToken();
     if (currentToken) {
       headers['Authorization'] = `Bearer ${currentToken}`;
     }
 
     try {
-      console.log(`[API] ${options.method || 'GET'} ${url} tokenPresent=${tokenPresent}`);
+      console.log(
+        `[API] ${options.method || 'GET'} ${url} tokenSource=${source} tokenLength=${currentToken ? currentToken.length : 0}`
+      );
 
       const response = await fetch(url, {
         ...options,
@@ -114,38 +136,54 @@ class ApiClient {
 
       const data = await response.json().catch(() => null);
 
-      console.log(`[API] ${options.method || 'GET'} ${url} status=${response.status}`);
+      console.log(
+        `[API] ${options.method || 'GET'} ${url} status=${response.status} code=${data?.code || '(none)'}`
+      );
 
       if (!response.ok) {
+        const serverMessage: string | undefined = data?.error || data?.message;
+
         if (response.status === 401) {
-          // Token expired or invalid
           return {
             success: false,
-            error: data?.error || data?.message || 'Authentication session expired. Please sign in again.',
-            code: 'UNAUTHORIZED',
+            error: serverMessage || 'Your CHECKSCROW session is no longer valid. Please sign in again.',
+            code: data?.code || 'UNAUTHORIZED',
+            status: response.status,
           };
         }
 
         if (response.status === 403) {
           return {
             success: false,
-            error: data?.error || data?.message || 'Access denied. You do not have permission to access this resource.',
-            code: 'FORBIDDEN',
+            error: serverMessage || 'Access denied. You do not have permission to access this resource.',
+            code: data?.code || 'FORBIDDEN',
+            status: response.status,
           };
         }
 
         if (response.status === 404) {
           return {
             success: false,
-            error: data?.error || data?.message || 'The requested CHECKSCROW API resource was not found. Please try again.',
-            code: 'NOT_FOUND',
+            error: serverMessage || 'This CHECKSCROW feature is not available on the server yet.',
+            code: data?.code || 'NOT_FOUND',
+            status: response.status,
+          };
+        }
+
+        if (response.status >= 500) {
+          return {
+            success: false,
+            error: serverMessage || 'CHECKSCROW is temporarily unavailable. Please try again shortly.',
+            code: data?.code || `ERR_${response.status}`,
+            status: response.status,
           };
         }
 
         return {
           success: false,
-          error: data?.error || data?.message || 'Something went wrong while connecting to CHECKSCROW. Please try again.',
+          error: serverMessage || 'Something went wrong while connecting to CHECKSCROW. Please try again.',
           code: data?.code || `ERR_${response.status}`,
+          status: response.status,
         };
       }
 
@@ -154,13 +192,14 @@ class ApiClient {
         data: data?.data ?? data,
         message: data?.message,
         pagination: data?.pagination,
+        status: response.status,
       };
     } catch (err: any) {
       // Surface the real transport-level failure (CORS, TLS, DNS, refused, etc.)
       console.error(`[API] Request to ${url} failed:`, err?.name, err?.message, err);
       return {
         success: false,
-        error: 'Unable to connect to CHECKSCROW server. Please check your internet connection.',
+        error: 'Unable to reach CHECKSCROW. Please check your internet connection and try again.',
         code: 'NETWORK_ERROR',
       };
     }

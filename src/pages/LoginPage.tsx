@@ -10,9 +10,9 @@ import { Mail, Lock, Eye, EyeOff, ShieldCheck, AlertCircle, ArrowRight, Loader2 
  * Connects directly to existing Clerk authentication (Google OAuth & Email/Password)
  */
 const ClerkNativeLoginForm: React.FC = () => {
-  const { isLoaded, signIn, setActive } = useSignIn();
+  const { isLoaded, signIn } = useSignIn();
   const clerk = useClerk();
-  const { setGuestExplorer } = useAuth();
+  const { setGuestExplorer, login, error: authError, clearError } = useAuth();
   const navigate = useNavigate();
 
   const [email, setEmail] = useState('');
@@ -20,7 +20,9 @@ const ClerkNativeLoginForm: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const errorMessage = localError || authError;
+  const setErrorMessage = setLocalError;
 
   const handleGoogleSignIn = async () => {
     setErrorMessage(null);
@@ -59,44 +61,26 @@ const ClerkNativeLoginForm: React.FC = () => {
     }
   };
 
+  /**
+   * Email/password accounts live in the CHECKSCROW PostgreSQL database, so the
+   * manual form authenticates against POST /auth/login and keeps the CHECKSCROW
+   * session token. Clerk is used for Google identities only.
+   */
   const handleEmailSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
-    setErrorMessage(null);
+    setLocalError(null);
+    clearError();
 
     if (!email.trim() || !password) {
-      setErrorMessage('Please enter your email address and password.');
-      return;
-    }
-
-    if (!isLoaded || !signIn) {
-      setErrorMessage('Authentication service is initializing. Please wait a moment.');
+      setLocalError('Please enter your email address and password.');
       return;
     }
 
     setIsLoading(true);
     try {
-      const result = await signIn.create({
-        identifier: email.trim(),
-        password,
-      });
-
-      if (result.status === 'complete') {
-        if (setActive) {
-          await setActive({ session: result.createdSessionId });
-        }
+      const success = await login({ email: email.trim().toLowerCase(), password });
+      if (success) {
         navigate('/dashboard');
-      } else if (result.status === 'needs_first_factor' || result.status === 'needs_second_factor') {
-        setErrorMessage('Additional verification required for your account.');
-      } else {
-        setErrorMessage(`Sign-in status: ${result.status}. Please check your credentials.`);
-      }
-    } catch (err: unknown) {
-      const clerkErr = err as { errors?: Array<{ message?: string; longMessage?: string; code?: string }> };
-      const firstErr = clerkErr?.errors?.[0];
-      if (firstErr?.code === 'form_identifier_not_found' || firstErr?.code === 'form_password_incorrect') {
-        setErrorMessage('Incorrect email address or password. Please try again.');
-      } else {
-        setErrorMessage(firstErr?.longMessage || firstErr?.message || 'Unable to sign in. Please verify your credentials.');
       }
     } finally {
       setIsLoading(false);
@@ -186,7 +170,8 @@ const ClerkNativeLoginForm: React.FC = () => {
                 value={email}
                 onChange={(e) => {
                   setEmail(e.target.value);
-                  if (errorMessage) setErrorMessage(null);
+                  setLocalError(null);
+                  clearError();
                 }}
                 disabled={isLoading || isGoogleLoading}
                 className="w-full h-12 bg-transparent px-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none disabled:opacity-50"
@@ -227,7 +212,8 @@ const ClerkNativeLoginForm: React.FC = () => {
                 value={password}
                 onChange={(e) => {
                   setPassword(e.target.value);
-                  if (errorMessage) setErrorMessage(null);
+                  setLocalError(null);
+                  clearError();
                 }}
                 disabled={isLoading || isGoogleLoading}
                 className="w-full h-12 bg-transparent px-3 pr-11 text-sm text-slate-100 placeholder-slate-500 focus:outline-none disabled:opacity-50"

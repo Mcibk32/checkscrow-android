@@ -168,6 +168,7 @@ export interface ApiResponse<T> {
   data?: T;
   error?: string;
   code?: string;
+  status?: number;
   pagination?: {
     total: number;
     page: number;

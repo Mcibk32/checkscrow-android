@@ -84,6 +84,7 @@ router.get('/debug/routes', (req, res) => {
       'POST /api/auth/login',
       'POST /api/auth/logout',
       'GET /api/auth/me',
+      'POST /api/auth/sync-login',
       'GET /api/dashboard',
       'GET /api/wallet/balance',
       'GET /api/wallet/transactions',
@@ -106,6 +107,10 @@ router.post('/auth/register', registerUser);
 router.post('/register', registerUser);
 router.post('/auth/login', loginUser);
 router.post('/login', loginUser);
+// Resolves (and, for a first-time Clerk identity, links or provisions) the
+// CHECKSCROW account behind a verified Clerk session. All verification and
+// linking happens inside requireAuth.
+router.post('/auth/sync-login', requireAuth, getCurrentUser);
 router.post('/auth/logout', logoutUser);
 router.post('/logout', logoutUser);
 

@@ -146,11 +146,18 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
           }
         }
 
-        // 3) Not found: auto-provision a new user and wallet atomically
+        // 3) Not found: auto-provision a new user and wallet atomically.
+        // Without a verified email we cannot prove this Clerk identity does
+        // not already own a CHECKSCROW account, so provisioning here would
+        // risk a duplicate/placeholder account. Refuse instead.
+        if (!clerkEmail) {
+          throw new Error('CLERK_EMAIL_UNRESOLVED');
+        }
+
         // Prepare safe values
         const newUserId = 'usr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
         const newWalletId = 'wal_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
-        const safeEmail = (clerkEmail || `${clerkUserId}@user.checkscrow.ng`).toLowerCase().trim();
+        const safeEmail = clerkEmail.toLowerCase().trim();
         const safeName = clerkFullName || 'CHECKSCROW User';
         const safePhone = clerkPhone || '';
         const now = new Date().toISOString();
@@ -240,6 +247,12 @@ export async function resolveUserFromToken(token: string): Promise<Authenticated
         };
       }
     } catch (err: any) {
+      if (err?.message === 'CLERK_EMAIL_UNRESOLVED') {
+        console.error(
+          `[Auth] No verified email available for Clerk uid=${clerkUserId.slice(0, 10)}...${clerkProfileFetchFailed ? ' (Clerk profile fetch failed)' : ''} - refusing to provision an account.`
+        );
+        return null;
+      }
       if (err?.message === 'CLERK_UID_CONFLICT') {
         console.error(`[Auth] Clerk UID conflict for uid=${clerkUserId.slice(0, 10)}... - existing account already linked to a different Clerk ID. Refusing to authenticate.`);
         return null;

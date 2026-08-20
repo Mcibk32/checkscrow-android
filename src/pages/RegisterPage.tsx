@@ -13,10 +13,7 @@ import {
   AlertCircle,
   ArrowRight,
   Loader2,
-  KeyRound,
-  CheckCircle2,
   Phone,
-  RefreshCw,
 } from 'lucide-react';
 
 /**
@@ -24,9 +21,9 @@ import {
  * Integrates with Clerk's existing OAuth and Email Verification flows
  */
 const ClerkNativeRegisterForm: React.FC = () => {
-  const { isLoaded, signUp, setActive } = useSignUp();
+  const { isLoaded, signUp } = useSignUp();
   const clerk = useClerk();
-  const { setGuestExplorer } = useAuth();
+  const { setGuestExplorer, register, error: authError, clearError } = useAuth();
   const navigate = useNavigate();
 
   // Registration Form State
@@ -36,17 +33,12 @@ const ClerkNativeRegisterForm: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [role, setRole] = useState<'buyer' | 'seller' | 'both'>('both');
 
-  // Verification State
-  const [pendingVerification, setPendingVerification] = useState(false);
-  const [verificationCode, setVerificationCode] = useState('');
-  const [resendSuccess, setResendSuccess] = useState(false);
-
   // Loading & Error States
   const [isLoading, setIsLoading] = useState(false);
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
-  const [isVerifying, setIsVerifying] = useState(false);
-  const [isResending, setIsResending] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const errorMessage = localError || authError;
+  const setErrorMessage = setLocalError;
 
   // 1. Google Sign Up
   const handleGoogleSignUp = async () => {
@@ -79,243 +71,49 @@ const ClerkNativeRegisterForm: React.FC = () => {
     }
   };
 
-  // 2. Email & Password Sign Up
+  /**
+   * Email/password accounts are created in the CHECKSCROW PostgreSQL database
+   * via POST /auth/register, which is what returns HTTP 409 EMAIL_ALREADY_EXISTS
+   * for an email that is already registered.
+   */
   const handleEmailSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
-    setErrorMessage(null);
+    setLocalError(null);
+    clearError();
 
     if (!fullName.trim() || !email.trim() || !password) {
-      setErrorMessage('Please fill in all required fields.');
+      setLocalError('Please fill in all required fields.');
       return;
     }
 
     if (password.length < 8) {
-      setErrorMessage('Password must be at least 8 characters long.');
-      return;
-    }
-
-    if (!isLoaded || !signUp) {
-      setErrorMessage('Authentication service is initializing. Please wait a moment.');
+      setLocalError('Password must be at least 8 characters long.');
       return;
     }
 
     setIsLoading(true);
     try {
-      const nameParts = fullName.trim().split(' ');
-      const firstName = nameParts[0] || fullName.trim();
-      const lastName = nameParts.slice(1).join(' ') || '';
-
-      await signUp.create({
-        emailAddress: email.trim(),
+      const success = await register({
+        fullName: fullName.trim(),
+        email: email.trim().toLowerCase(),
         password,
-        firstName,
-        lastName: lastName || undefined,
-        unsafeMetadata: { role },
+        confirmPassword: password,
+        role,
       });
-
-      // Prepare Clerk Email OTP verification
-      await signUp.prepareEmailAddressVerification({ strategy: 'email_code' });
-      setPendingVerification(true);
-    } catch (err: unknown) {
-      const clerkErr = err as { errors?: Array<{ message?: string; longMessage?: string; code?: string }> };
-      const firstErr = clerkErr?.errors?.[0];
-      if (firstErr?.code === 'form_identifier_exists') {
-        setErrorMessage('An account with this email address already exists. Please sign in instead.');
-      } else if (firstErr?.code === 'form_password_pwned' || firstErr?.code === 'form_password_length_too_short') {
-        setErrorMessage(firstErr?.longMessage || 'Password must be stronger and at least 8 characters.');
-      } else {
-        setErrorMessage(firstErr?.longMessage || firstErr?.message || 'Unable to create account. Please try again.');
+      if (success) {
+        navigate('/dashboard');
       }
     } finally {
       setIsLoading(false);
     }
   };
 
-  // 3. Email Code Verification Submission
-  const handleVerifyCode = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMessage(null);
-
-    if (!verificationCode.trim()) {
-      setErrorMessage('Please enter the 6-digit verification code.');
-      return;
-    }
-
-    if (!isLoaded || !signUp) return;
-
-    setIsVerifying(true);
-    try {
-      const completeSignUp = await signUp.attemptEmailAddressVerification({
-        code: verificationCode.trim(),
-      });
-
-      if (completeSignUp.status === 'complete') {
-        if (setActive) {
-          await setActive({ session: completeSignUp.createdSessionId });
-        }
-        navigate('/dashboard');
-      } else {
-        setErrorMessage('Verification incomplete. Please check your verification code.');
-      }
-    } catch (err: unknown) {
-      const clerkErr = err as { errors?: Array<{ message?: string; longMessage?: string; code?: string }> };
-      const firstErr = clerkErr?.errors?.[0];
-      if (firstErr?.code === 'form_code_incorrect') {
-        setErrorMessage('The verification code entered is incorrect. Please try again.');
-      } else {
-        setErrorMessage(firstErr?.longMessage || firstErr?.message || 'Verification failed. Please try again.');
-      }
-    } finally {
-      setIsVerifying(false);
-    }
-  };
-
-  // 4. Resend Code
-  const handleResendCode = async () => {
-    if (!isLoaded || !signUp) return;
-    setIsResending(true);
-    setResendSuccess(false);
-    setErrorMessage(null);
-    try {
-      await signUp.prepareEmailAddressVerification({ strategy: 'email_code' });
-      setResendSuccess(true);
-      setTimeout(() => setResendSuccess(false), 5000);
-    } catch (err: unknown) {
-      const clerkErr = err as { errors?: Array<{ message?: string; longMessage?: string }> };
-      setErrorMessage(clerkErr?.errors?.[0]?.longMessage || 'Unable to resend code right now.');
-    } finally {
-      setIsResending(false);
-    }
-  };
 
   const handlePreviewAsGuest = () => {
     setGuestExplorer(true);
     navigate('/dashboard');
   };
 
-  // RENDER: Email Verification Screen
-  if (pendingVerification) {
-    return (
-      <div className="w-full space-y-6">
-        {/* Verification Brand Header */}
-        <div className="flex flex-col items-center text-center space-y-2">
-          <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center shadow-lg shadow-emerald-500/10">
-            <KeyRound className="w-6 h-6 text-emerald-400" />
-          </div>
-          <div className="space-y-1">
-            <span className="text-[10px] font-mono font-semibold tracking-widest text-emerald-400 uppercase">
-              SECURITY VERIFICATION
-            </span>
-            <h1 className="text-2xl font-bold text-white tracking-tight">
-              Verify your email
-            </h1>
-            <p className="text-xs text-slate-400 max-w-xs">
-              We sent a 6-digit verification code to <span className="font-semibold text-slate-200">{email}</span>
-            </p>
-          </div>
-        </div>
-
-        {/* Verification Card Container */}
-        <div className="bg-[#11141D] border border-slate-800/80 rounded-2xl p-5 sm:p-6 shadow-xl shadow-black/40 space-y-5">
-          {/* Error Message */}
-          {errorMessage && (
-            <div
-              role="alert"
-              className="p-3.5 rounded-xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-200 flex items-start gap-2.5 animate-fadeIn"
-            >
-              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-              <div className="flex-1 leading-relaxed">{errorMessage}</div>
-            </div>
-          )}
-
-          {/* Resend Success Banner */}
-          {resendSuccess && (
-            <div className="p-3.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 text-xs text-emerald-300 flex items-center gap-2.5">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>A new verification code was sent to your email.</span>
-            </div>
-          )}
-
-          <form onSubmit={handleVerifyCode} className="space-y-4">
-            <div className="space-y-1.5">
-              <label
-                htmlFor="verification-code"
-                className="block text-xs font-medium text-slate-300"
-              >
-                6-Digit Verification Code
-              </label>
-              <div className="relative flex items-center rounded-xl bg-[#0B0C10] border border-slate-800 focus-within:border-emerald-500 focus-within:ring-1 focus-within:ring-emerald-500 transition-all">
-                <input
-                  id="verification-code"
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  maxLength={6}
-                  placeholder="123456"
-                  value={verificationCode}
-                  onChange={(e) => {
-                    setVerificationCode(e.target.value.replace(/\D/g, ''));
-                    if (errorMessage) setErrorMessage(null);
-                  }}
-                  autoFocus
-                  disabled={isVerifying}
-                  className="w-full h-14 bg-transparent px-4 text-center text-xl font-mono tracking-widest text-slate-100 placeholder-slate-600 focus:outline-none disabled:opacity-50"
-                  required
-                />
-              </div>
-            </div>
-
-            {/* Verify Action Button */}
-            <button
-              type="submit"
-              disabled={isVerifying || verificationCode.length < 6}
-              className="w-full h-12 rounded-xl bg-emerald-500 hover:bg-emerald-400 active:scale-[0.99] text-slate-950 font-bold text-sm tracking-wide transition-all shadow-md shadow-emerald-500/20 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-            >
-              {isVerifying ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
-                  <span>Verifying code...</span>
-                </>
-              ) : (
-                <>
-                  <span>Verify & Continue</span>
-                  <ArrowRight className="w-4 h-4" />
-                </>
-              )}
-            </button>
-          </form>
-
-          {/* Resend Code & Back Buttons */}
-          <div className="pt-2 flex flex-col items-center gap-3 border-t border-slate-800/80">
-            <button
-              type="button"
-              onClick={handleResendCode}
-              disabled={isResending || isVerifying}
-              className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-400 hover:text-emerald-300 transition-colors disabled:opacity-50 cursor-pointer"
-            >
-              {isResending ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="w-3.5 h-3.5" />
-              )}
-              <span>Resend verification code</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setPendingVerification(false);
-                setErrorMessage(null);
-              }}
-              className="text-xs text-slate-400 hover:text-slate-200 transition-colors"
-            >
-              ← Edit email address
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   // RENDER: Main Signup Screen
   return (

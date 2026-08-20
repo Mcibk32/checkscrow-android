@@ -37,6 +37,10 @@ const getBaseUrl = (): string => {
 
 const API_BASE_URL = getBaseUrl();
 
+// DEVELOPMENT DIAGNOSTIC: Print the resolved base URL at module initialization.
+// This is safe: it does not print tokens or secrets. Remove this before shipping.
+console.log('[API DEBUG] Resolved API_BASE_URL =', API_BASE_URL);
+
 const SESSION_TOKEN_KEY = 'checkscrow_auth_token';
 
 export type TokenSource = 'session' | 'clerk' | 'none';
@@ -125,20 +129,29 @@ class ApiClient {
     }
 
     try {
-      console.log(
-        `[API] ${options.method || 'GET'} ${url} tokenSource=${source} tokenLength=${currentToken ? currentToken.length : 0}`
-      );
+      // DEVELOPMENT DIAGNOSTIC LOGGING (safe): method, full URL, token presence/length/prefix
+      const method = (options.method || 'GET').toUpperCase();
+      const tokenPresent = !!currentToken;
+      const tokenLength = currentToken ? currentToken.length : 0;
+      const tokenPrefix = currentToken ? currentToken.slice(0, 8) : null;
+
+      console.log(`[API DEBUG] ${method} ${url} tokenSource=${source} tokenPresent=${tokenPresent} tokenLength=${tokenLength} tokenPrefix=${tokenPrefix}`);
 
       const response = await fetch(url, {
         ...options,
         headers,
       });
 
-      const data = await response.json().catch(() => null);
+      const text = await response.text().catch(() => null);
+      let data: any = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch (e) {
+        // keep raw text in data for diagnostics
+        data = text;
+      }
 
-      console.log(
-        `[API] ${options.method || 'GET'} ${url} status=${response.status} code=${data?.code || '(none)'}`
-      );
+      console.log(`[API DEBUG] ${method} ${url} status=${response.status} bodyPreview=${typeof data === 'string' ? data?.slice?.(0,200) : JSON.stringify(data)?.slice?.(0,200)}`);
 
       if (!response.ok) {
         const serverMessage: string | undefined = data?.error || data?.message;
@@ -195,8 +208,18 @@ class ApiClient {
         status: response.status,
       };
     } catch (err: any) {
-      // Surface the real transport-level failure (CORS, TLS, DNS, refused, etc.)
-      console.error(`[API] Request to ${url} failed:`, err?.name, err?.message, err);
+      // DEVELOPMENT DIAGNOSTIC: Surface transport-level failure with rich but safe details
+      const errName = err?.name || '(unknown)';
+      const errMessage = err?.message || '(no message)';
+      console.error(`[API DEBUG] Request to ${url} failed:`, errName, errMessage);
+
+      // Additional heuristics to help differentiate failures
+      try {
+        if (typeof window !== 'undefined' && (window as any).navigator && !(window as any).navigator.onLine) {
+          console.warn('[API DEBUG] Navigator reports offline');
+        }
+      } catch {}
+
       return {
         success: false,
         error: 'Unable to reach CHECKSCROW. Please check your internet connection and try again.',
